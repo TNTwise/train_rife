@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 from torch.optim import AdamW
 import torch.optim as optim
 import itertools
@@ -60,25 +61,66 @@ class Model:
         self.flownet.to(device)
 
     def load_model(self, path, rank=0):
-        def convert(param):
-            if rank == -1:
-                return {
-                    k.replace("module.", ""): v
-                    for k, v in param.items()
-                    if "module." in k
-                }
-            else:
-                return param
-        if rank <= 0:
-            if torch.cuda.is_available():
-                param = convert(torch.load('{}/flownet.pkl'.format(path)))
-                self.flownet_update.load_state_dict(param, False)
+        def _load_checkpoint_object(p: str):
+            # Supports both directory paths (containing flownet.pkl) and direct file paths.
+            if os.path.isdir(p):
+                p = os.path.join(p, 'flownet.pkl')
+            return torch.load(p, map_location='cpu')
+
+        def _extract_state_dict(obj):
+            # Common conventions: raw state_dict, {'state_dict': ...}, {'model': ...}, etc.
+            if isinstance(obj, dict):
+                if obj and all(torch.is_tensor(v) for v in obj.values()):
+                    return obj
+                for key in ('state_dict', 'model', 'net', 'params', 'flownet'):
+                    val = obj.get(key)
+                    if isinstance(val, dict) and val and all(torch.is_tensor(v) for v in val.values()):
+                        return val
+            raise ValueError('Unsupported checkpoint format: expected a state_dict or a dict containing one.')
+
+        def _strip_known_prefixes(state_dict):
+            # Strip DDP/DataParallel prefix.
+            out = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    k = k[len('module.'):]
+                # Some checkpoints save with an extra top-level prefix.
+                for prefix in ('flownet_update.', 'flownet.', 'net.', 'model.'):
+                    if k.startswith(prefix):
+                        k = k[len(prefix):]
+                out[k] = v
+            return out
+
+        if rank <= 0 and torch.cuda.is_available():
+            ckpt_obj = _load_checkpoint_object(path)
+            param = _strip_known_prefixes(_extract_state_dict(ckpt_obj))
+
+            # Always load into the underlying module.
+            # This makes checkpoints portable across: single-GPU, DataParallel, and DDP.
+            target = self._get_module(self.flownet_update)
+            # strict=False to allow backward/forward-compatible checkpoints.
+            incompatible = target.load_state_dict(param, strict=False)
+            missing = list(getattr(incompatible, 'missing_keys', []))
+            unexpected = list(getattr(incompatible, 'unexpected_keys', []))
+            if missing or unexpected:
+                print(
+                    f'[Model.load_model] Loaded with strict=False. '
+                    f'missing={len(missing)} unexpected={len(unexpected)}'
+                )
+                if missing:
+                    print('[Model.load_model] Missing keys (first 20):', missing[:20])
+                if unexpected:
+                    print('[Model.load_model] Unexpected keys (first 20):', unexpected[:20])
         hard_update(self.flownet, self.flownet_update)
         hard_update(self.encode_target, self._get_module(self.flownet).encode)
         
     def save_model(self, path, rank=0):
         if rank == 0:
-            torch.save(self.flownet.state_dict(),'{}/flownet.pkl'.format(path))
+            # Save with a consistent "module." prefix for compatibility with common
+            # RIFE checkpoints/loaders that expect keys like "module.encode.*".
+            state = self._get_module(self.flownet).state_dict()
+            state = {('module.' + k) if not k.startswith('module.') else k: v for k, v in state.items()}
+            torch.save(state, '{}/flownet.pkl'.format(path))
 
     def encode_loss(self, X, Y):
         loss = 0

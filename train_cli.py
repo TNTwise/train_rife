@@ -28,6 +28,7 @@ import torch.distributed as dist
 import numpy as np
 import random
 import argparse
+import signal
 from pathlib import Path
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -348,11 +349,28 @@ def train(args):
     
     # Setup logging
     log_path = os.path.join(args.log_dir, args.exp_name)
+    writer = None
+    writer_val = None
     if is_main:
         os.makedirs(log_path, exist_ok=True)
         writer = SummaryWriter(os.path.join(log_path, 'train'))
         writer_val = SummaryWriter(os.path.join(log_path, 'validate'))
         print(f"Logging to: {log_path}")
+
+    stop_state = {'stop': False}
+
+    def _request_stop(_signum=None, _frame=None):
+        # Avoid raising KeyboardInterrupt inside CUDA kernels; request a clean stop instead.
+        stop_state['stop'] = True
+        if is_main:
+            print('Ctrl+C received: stopping after current iteration and saving...')
+
+    # Prefer signal-based stop so all ranks break out similarly.
+    try:
+        signal.signal(signal.SIGINT, _request_stop)
+    except Exception:
+        # Some environments may not allow custom signal handlers; fallback to KeyboardInterrupt.
+        pass
     
     # Create datasets
     train_dataset = SimpleDataset(
@@ -445,106 +463,146 @@ def train(args):
     if is_main:
         print("Starting training...")
     
-    for epoch in range(args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        
-        model.train()
-        epoch_loss = 0
-        time_stamp = time.time()
-        
-        for i, (data_gpu, timestep) in enumerate(train_loader):
-            data_time = time.time() - time_stamp
-            time_stamp = time.time()
-            
-            # Move data to device
-            data_gpu = data_gpu.to(device, non_blocking=True) / 255.
-            timestep = timestep.to(device, non_blocking=True)
-            
-            # Extract images
-            imgs = data_gpu[:, :6]  # img0 and img1
-            gt = data_gpu[:, 6:9]   # ground truth
-            
-            # Horizontal flip augmentation (batch-level)
-            imgs = torch.cat((imgs, imgs.flip(-1)), 0)
-            gt = torch.cat((gt, gt.flip(-1)), 0)
-            timestep = torch.cat((timestep, timestep.flip(-1)), 0)
-            
-            # Get learning rate
-            learning_rate = get_learning_rate(step, args, total_steps)
-            
-            # Forward and backward pass
-            if args.fp16:
-                with torch.cuda.amp.autocast():
-                    pred, info = model.update(imgs, gt, learning_rate, training=True, 
-                                            distill=True, timestep=timestep)
-            else:
-                pred, info = model.update(imgs, gt, learning_rate, training=True, 
-                                        distill=True, timestep=timestep)
-            
-            train_time = time.time() - time_stamp
-            time_stamp = time.time()
-            epoch_loss += info['loss_l1']
-            
-            # Logging
-            if step % args.log_interval == 0 and is_main:
-                writer.add_scalar('learning_rate', learning_rate, step)
-                writer.add_scalar('loss/l1', info['loss_l1'], step)
-                writer.add_scalar('loss/tea', info['loss_tea'], step)
-                writer.add_scalar('loss/cons', info['loss_cons'], step)
-                writer.add_scalar('loss/time', info['loss_time'], step)
-                writer.add_scalar('loss/encode', info['loss_encode'], step)
-                writer.add_scalar('loss/vgg', info['loss_vgg'], step)
-                writer.add_scalar('loss/gram', info['loss_gram'], step)
-            
-            # Image logging
-            if step % args.img_log_interval == 0 and is_main:
-                gt_vis = (gt.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
-                pred_vis = (pred.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
-                merged_img = (info['merged_tea'].permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
-                flow0 = info['flow'].permute(0, 2, 3, 1).detach().cpu().numpy()
-                flow1 = info['flow_tea'].permute(0, 2, 3, 1).detach().cpu().numpy()
-                
-                for j in range(min(2, gt_vis.shape[0])):
-                    imgs_concat = np.concatenate((merged_img[j], pred_vis[j], gt_vis[j]), 1)[:, :, ::-1]
-                    writer.add_image(f'{j}/img', imgs_concat, step, dataformats='HWC')
-                    writer.add_image(f'{j}/flow', np.concatenate((flow2rgb(flow0[j]), flow2rgb(flow1[j])), 1), 
-                                   step, dataformats='HWC')
-                writer.flush()
-            
-            # Print progress
-            if is_main and i % 50 == 0:
-                print(f'Epoch {epoch} [{i}/{steps_per_epoch}] '
-                      f'time: {data_time:.2f}+{train_time:.2f} '
-                      f'lr: {learning_rate:.2e} '
-                      f'loss_l1: {info["loss_l1"]:.4e}')
-            
-            step += 1
-        
-        # End of epoch
-        avg_loss = epoch_loss / steps_per_epoch
-        if is_main:
-            print(f'Epoch {epoch} completed. Average loss: {avg_loss:.4e}')
-        
-        # Validation
-        if (epoch + 1) % args.eval_interval == 0:
-            psnr = evaluate(model, val_loader, device, is_main, 
-                          writer_val if is_main else None, step, loss_fn_alex)
-            if is_main and psnr > best_psnr:
-                best_psnr = psnr
-                model.save_model(os.path.join(log_path, 'best'), rank=0)
-                print(f'New best PSNR: {best_psnr:.2f}')
-        
-        # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            model.save_model(log_path, rank=args.rank)
+    interrupted = False
+    try:
+        for epoch in range(args.epochs):
+            if stop_state['stop']:
+                break
+
             if args.distributed:
-                dist.barrier()
-    
-    if is_main:
+                train_sampler.set_epoch(epoch)
+            
+            model.train()
+            epoch_loss = 0
+            time_stamp = time.time()
+            steps_in_epoch = 0
+            
+            for i, (data_gpu, timestep) in enumerate(train_loader):
+                if stop_state['stop']:
+                    break
+                data_time = time.time() - time_stamp
+                time_stamp = time.time()
+                
+                # Move data to device
+                data_gpu = data_gpu.to(device, non_blocking=True) / 255.
+                timestep = timestep.to(device, non_blocking=True)
+                
+                # Extract images
+                imgs = data_gpu[:, :6]  # img0 and img1
+                gt = data_gpu[:, 6:9]   # ground truth
+                
+                # Horizontal flip augmentation (batch-level)
+                imgs = torch.cat((imgs, imgs.flip(-1)), 0)
+                gt = torch.cat((gt, gt.flip(-1)), 0)
+                timestep = torch.cat((timestep, timestep.flip(-1)), 0)
+                
+                # Get learning rate
+                learning_rate = get_learning_rate(step, args, total_steps)
+                
+                # Forward and backward pass
+                if args.fp16:
+                    with torch.cuda.amp.autocast():
+                        pred, info = model.update(
+                            imgs, gt, learning_rate, training=True, distill=True, timestep=timestep
+                        )
+                else:
+                    pred, info = model.update(
+                        imgs, gt, learning_rate, training=True, distill=True, timestep=timestep
+                    )
+                
+                train_time = time.time() - time_stamp
+                time_stamp = time.time()
+                epoch_loss += info['loss_l1']
+                steps_in_epoch += 1
+                
+                # Logging
+                if step % args.log_interval == 0 and is_main and writer is not None:
+                    writer.add_scalar('learning_rate', learning_rate, step)
+                    writer.add_scalar('loss/l1', info['loss_l1'], step)
+                    writer.add_scalar('loss/tea', info['loss_tea'], step)
+                    writer.add_scalar('loss/cons', info['loss_cons'], step)
+                    writer.add_scalar('loss/time', info['loss_time'], step)
+                    writer.add_scalar('loss/encode', info['loss_encode'], step)
+                    writer.add_scalar('loss/vgg', info['loss_vgg'], step)
+                    writer.add_scalar('loss/gram', info['loss_gram'], step)
+                
+                # Image logging
+                if step % args.img_log_interval == 0 and is_main and writer is not None:
+                    gt_vis = (gt.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
+                    pred_vis = (pred.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
+                    merged_img = (info['merged_tea'].permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype('uint8')
+                    flow0 = info['flow'].permute(0, 2, 3, 1).detach().cpu().numpy()
+                    flow1 = info['flow_tea'].permute(0, 2, 3, 1).detach().cpu().numpy()
+                    
+                    for j in range(min(2, gt_vis.shape[0])):
+                        imgs_concat = np.concatenate((merged_img[j], pred_vis[j], gt_vis[j]), 1)[:, :, ::-1]
+                        writer.add_image(f'{j}/img', imgs_concat, step, dataformats='HWC')
+                        writer.add_image(
+                            f'{j}/flow',
+                            np.concatenate((flow2rgb(flow0[j]), flow2rgb(flow1[j])), 1),
+                            step,
+                            dataformats='HWC'
+                        )
+                    writer.flush()
+                
+                # Print progress
+                if is_main and i % 50 == 0:
+                    print(
+                        f'Epoch {epoch} [{i}/{steps_per_epoch}] '
+                        f'time: {data_time:.2f}+{train_time:.2f} '
+                        f'lr: {learning_rate:.2e} '
+                        f'loss_l1: {info["loss_l1"]:.4e}'
+                    )
+                
+                step += 1
+
+            # End of epoch
+            denom = steps_in_epoch if steps_in_epoch > 0 else 1
+            avg_loss = epoch_loss / denom
+            if is_main:
+                print(f'Epoch {epoch} completed. Average loss: {avg_loss:.4e}')
+            
+            # Validation
+            if not stop_state['stop'] and (epoch + 1) % args.eval_interval == 0:
+                psnr = evaluate(
+                    model, val_loader, device, is_main,
+                    writer_val if is_main else None, step, loss_fn_alex
+                )
+                if is_main and psnr > best_psnr:
+                    best_psnr = psnr
+                    model.save_model(os.path.join(log_path, 'best'), rank=0)
+                    print(f'New best PSNR: {best_psnr:.2f}')
+            
+            # Save checkpoint
+            if (epoch + 1) % args.save_interval == 0 or stop_state['stop']:
+                model.save_model(log_path, rank=args.rank)
+                if args.distributed and dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+            
+            if stop_state['stop']:
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_state['stop'] = True
+    finally:
+        # Best-effort final save on exit (Ctrl+C or normal completion)
+        if stop_state['stop'] and is_main:
+            model.save_model(log_path, rank=0)
+        if writer is not None:
+            writer.flush()
+            writer.close()
+        if writer_val is not None:
+            writer_val.flush()
+            writer_val.close()
+        if args.distributed and dist.is_available() and dist.is_initialized():
+            # Avoid leaving NCCL process group in a bad state.
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+
+    if is_main and not stop_state['stop'] and not interrupted:
         print(f"Training completed. Best PSNR: {best_psnr:.2f}")
-        writer.close()
-        writer_val.close()
 
 
 def evaluate(model, val_loader, device, is_main, writer_val, step, loss_fn_alex=None):

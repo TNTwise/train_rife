@@ -7,6 +7,7 @@ import torch.distributed as dist
 import numpy as np
 import random
 import argparse
+import signal
 from torch.autograd import Variable
 import skimage.measure as skim
 import scipy.misc
@@ -14,6 +15,13 @@ from skimage.color import rgb2yuv, yuv2rgb
 from yuv_frame_io import YUV_Read,YUV_Write
 import lpips
 loss_fn_alex = lpips.LPIPS(net='alex').cuda()
+
+_stop_training = False
+
+
+def _handle_sigint(_signum=None, _frame=None):
+    global _stop_training
+    _stop_training = True
 
 torch.distributed.init_process_group(backend="nccl", world_size=8)
 local_rank = torch.distributed.get_rank()
@@ -59,9 +67,14 @@ def train(model):
     # evaluate(model, val_data, 0)
     print('training...')
     time_stamp = time.time()
+    global _stop_training
     for epoch in range(args.epoch):
+        if _stop_training:
+            break
         sampler.set_epoch(epoch)
         for i, data in enumerate(train_data):
+            if _stop_training:
+                break
             data_time_interval = time.time() - time_stamp
             time_stamp = time.time()
             data_gpu, timestep = data
@@ -107,6 +120,12 @@ def train(model):
             evaluate(model, val_data, step)
         model.save_model(log_path, local_rank)    
         dist.barrier()
+
+    # If interrupted mid-epoch, ensure we still save before exit.
+    if _stop_training:
+        model.save_model(log_path, local_rank)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
 def evaluate(model, val_data, nr_eval):
     loss_l1_list = []
@@ -164,5 +183,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # args.step_per_epoch = 51313 // args.batch_size    
     model = Model(args.local_rank)
+    try:
+        signal.signal(signal.SIGINT, _handle_sigint)
+    except Exception:
+        pass
     train(model)
         
