@@ -563,7 +563,7 @@ def train(args):
                 print(f'Epoch {epoch} completed. Average loss: {avg_loss:.4e}')
             
             # Validation
-            if not stop_state['stop'] and (epoch + 1) % args.eval_interval == 0:
+            """if not stop_state['stop'] and (epoch + 1) % args.eval_interval == 0:
                 psnr = evaluate(
                     model, val_loader, device, is_main,
                     writer_val if is_main else None, step, loss_fn_alex
@@ -571,7 +571,7 @@ def train(args):
                 if is_main and psnr > best_psnr:
                     best_psnr = psnr
                     model.save_model(os.path.join(log_path, 'best'), rank=0)
-                    print(f'New best PSNR: {best_psnr:.2f}')
+                    print(f'New best PSNR: {best_psnr:.2f}')"""
             
             # Save checkpoint
             if (epoch + 1) % args.save_interval == 0 or stop_state['stop']:
