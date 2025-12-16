@@ -37,6 +37,7 @@ class Model:
         self.vgg = VGGPerceptualLoss().to(device)
         self.encode_target = Head()
         self.local_rank = local_rank
+        self.iteration = 0
         self.device()
         if local_rank != -1:
             self.flownet_update = DDP(self.flownet_update, device_ids=[local_rank], output_device=local_rank)
@@ -120,8 +121,8 @@ class Model:
             # RIFE checkpoints/loaders that expect keys like "module.encode.*".
             state = self._get_module(self.flownet).state_dict()
             state = {('module.' + k) if not k.startswith('module.') else k: v for k, v in state.items()}
-            torch.save(state, '{}/flownet.pkl'.format(path))
-
+            torch.save(state, '{}/flownet{}.pkl'.format(path, self.iteration))
+            self.iteration += 1
     def encode_loss(self, X, Y):
         loss = 0
         X = self.encode_target(X, True)
