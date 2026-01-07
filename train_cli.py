@@ -222,6 +222,8 @@ class SimpleDataset(Dataset):
         img = cv2.imread(path)
         if img is None:
             raise ValueError(f"Failed to load image: {path}")
+        # OpenCV loads images in BGR; RIFE/VGG perceptual loss expects RGB.
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
     
     def _augment(self, img0, gt, img1):
@@ -490,11 +492,8 @@ def train(args):
                 # Extract images
                 imgs = data_gpu[:, :6]  # img0 and img1
                 gt = data_gpu[:, 6:9]   # ground truth
-                
-                # Horizontal flip augmentation (batch-level)
-                imgs = torch.cat((imgs, imgs.flip(-1)), 0)
-                gt = torch.cat((gt, gt.flip(-1)), 0)
-                timestep = torch.cat((timestep, timestep.flip(-1)), 0)
+                # NOTE: Dataset already applies random flips. Avoid doubling the batch here,
+                # which changes effective batch size and learning-rate dynamics.
                 
                 # Get learning rate
                 learning_rate = get_learning_rate(step, args, total_steps)
@@ -535,7 +534,7 @@ def train(args):
                     flow1 = info['flow_tea'].permute(0, 2, 3, 1).detach().cpu().numpy()
                     
                     for j in range(min(2, gt_vis.shape[0])):
-                        imgs_concat = np.concatenate((merged_img[j], pred_vis[j], gt_vis[j]), 1)[:, :, ::-1]
+                        imgs_concat = np.concatenate((merged_img[j], pred_vis[j], gt_vis[j]), 1)
                         writer.add_image(f'{j}/img', imgs_concat, step, dataformats='HWC')
                         writer.add_image(
                             f'{j}/flow',
@@ -619,7 +618,7 @@ def evaluate(model, val_loader, device, is_main, writer_val, step, loss_fn_alex=
             imgs = data_gpu[:, :6]
             gt = data_gpu[:, 6:9]
             
-            pred, info = model.update(imgs, gt, training=False)
+            pred, info = model.update(imgs, gt, training=False, timestep=timestep)
             
             # Calculate PSNR
             for j in range(gt.shape[0]):
@@ -638,7 +637,7 @@ def evaluate(model, val_loader, device, is_main, writer_val, step, loss_fn_alex=
                 merged_img = (info['merged_tea'].permute(0, 2, 3, 1).cpu().numpy() * 255).astype('uint8')
                 
                 for j in range(min(4, gt_vis.shape[0])):
-                    imgs_concat = np.concatenate((merged_img[j], pred_vis[j], gt_vis[j]), 1)[:, :, ::-1]
+                    imgs_concat = np.concatenate((merged_img[j], pred_vis[j], gt_vis[j]), 1)
                     writer_val.add_image(f'{j}/img', imgs_concat.copy(), step, dataformats='HWC')
     
     avg_psnr = np.mean(psnr_list)
